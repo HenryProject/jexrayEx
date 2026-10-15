@@ -1,9 +1,13 @@
 package com.jexray.jadx.export;
 
+import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.Writer;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -117,27 +121,53 @@ public final class ProjectExporter {
 	/** Makes sure a library is analyzed in the bridge before its functions are fetched. */
 	@FunctionalInterface
 	public interface Analyzer {
-		/** Blocks until {@code soId} is ready; {@code null}-progress, since the caller reports its
-		 * own "analyzing" phase through {@link ProgressListener}. */
-		void ensureAnalyzed(String soId) throws IOException, InterruptedException, BridgeException;
+		/**
+		 * Blocks until {@code soId} is ready. The {@link AnalysisWatch} keeps the run live while
+		 * that happens: it forwards the bridge's own status (so the analyzing phase can show
+		 * function-level progress instead of a frozen bar) and it is polled for cancellation, so
+		 * Cancel takes effect while Ghidra is still working -- not merely between libraries.
+		 */
+		void ensureAnalyzed(String soId, AnalysisWatch watch)
+				throws IOException, InterruptedException, BridgeException;
+	}
+
+	/** Progress + cancellation for one library's analysis phase; see {@link Analyzer}. */
+	public interface AnalysisWatch {
+		/** True the moment the user asked the run to stop; implementations poll this and throw
+		 * {@link InterruptedException} as soon as they see it. */
+		boolean cancelled();
+
+		/** The bridge's own status for the library under analysis: its state, how many functions
+		 * it has analyzed so far (0/0 while unknown, e.g. queued), and its current task text. */
+		void onStatus(String status, int completed, int total, String message);
 	}
 
 	/** Where a run currently is. Called from the exporter's own thread, once per function. */
 	public interface ProgressListener {
 		void onProgress(Progress p);
+
+		/**
+		 * One library reached its final outcome (exported, or why it produced nothing).
+		 * {@code index} is its position in the run's library list, so a UI can keep one status
+		 * row per library and finalize the right one.
+		 */
+		default void onLibraryDone(int index, LibraryResult r) {
+		}
 	}
 
 	/**
 	 * One progress sample. {@code phase} is {@code "analyzing"} while Ghidra is still working on
-	 * the library (counts unknown, so the bar is indeterminate), {@code "exporting"} while files
-	 * are being written ({@code doneFunctions}/{@code totalFunctions} count the listed functions
-	 * of the current library, imports included).
+	 * the library -- {@code doneFunctions}/{@code totalFunctions} then carry the bridge's own
+	 * analysis counts (0/0 while unknown, e.g. queued), which makes even that phase determinate;
+	 * {@code "exporting"} while files are being written, counting the listed functions of the
+	 * current library, imports included. {@code detail} is the bridge's current task text, if any.
 	 */
 	public record Progress(int libIndex, int libCount, String libraryName, String phase,
-			int doneFunctions, int totalFunctions) {
+			int doneFunctions, int totalFunctions, String detail) {
 		/** Overall determinate percentage across all libraries, or -1 while nothing is measurable. */
 		public int overallPercent() {
-			if (libCount <= 0 || !"exporting".equals(phase) || totalFunctions <= 0) {
+			if (libCount <= 0 || totalFunctions <= 0
+					|| (!"exporting".equals(phase) && !"analyzing".equals(phase))) {
 				return -1;
 			}
 			int idx = Math.max(0, Math.min(libIndex, libCount - 1));
@@ -191,6 +221,26 @@ public final class ProjectExporter {
 					: base + " with problems (" + String.join(", ", bits) + ") — see "
 							+ MANIFEST_NAME + " for details.";
 		}
+
+		/**
+		 * True only when nothing went wrong: not cancelled, no failed library, no failed function,
+		 * and no recorded problem -- an unwritable export root included. This is the exact rule
+		 * the dialog auto-closes on. Checking the library list alone is not enough: a run-level
+		 * failure (the output folder could not be created) has an <em>empty</em> library list and
+		 * must still stay open, and a library whose functions all failed to fetch has no library
+		 * error either but must also stay open.
+		 */
+		public boolean isClean() {
+			if (cancelled || failedFunctions > 0 || !problems.isEmpty()) {
+				return false;
+			}
+			for (LibraryResult r : libraryResults) {
+				if (r.failed()) {
+					return false;
+				}
+			}
+			return true;
+		}
 	}
 
 	/** Folder name of each group, exactly as the All Functions tree spells them, in tree order. */
@@ -214,6 +264,8 @@ public final class ProjectExporter {
 
 	private static final String PSEUDO_EXT = ".c";
 	private static final String DISASM_EXT = ".asm";
+	/** Suffix of the single-file layout's temp file, moved into place only when complete. */
+	private static final String PART_SUFFIX = ".part";
 
 	private final String pluginVersion;
 	private final String ghidraVersion;
@@ -230,7 +282,10 @@ public final class ProjectExporter {
 
 	/**
 	 * Run the export on the calling thread. Cancellation is checked between libraries and between
-	 * functions, so the worst it ever costs to cancel is one in-flight bridge request.
+	 * functions, and polled continuously while a library is still being analyzed (worst case: the
+	 * analysis of one library notices within a poll interval -- the run never waits for Ghidra to
+	 * finish just to be allowed to stop). A cancellation during analysis is reported as a
+	 * cancelled run, never as a library failure.
 	 */
 	public Result run(Options options, List<Library> libraries, AtomicBoolean cancelled,
 			ProgressListener progress) {
@@ -253,27 +308,52 @@ public final class ProjectExporter {
 					wasCancelled = true;
 					break;
 				}
+				final int libIndex = i;
 				String libName = lib.displayName();
-				report(progress, new Progress(i, libCount, libName, "analyzing", 0, 0));
+				report(progress, new Progress(i, libCount, libName, "analyzing", 0, 0, null));
+				// The watch turns the blocking analysis call into a live phase: the bridge's own
+				// completed/total counts feed the progress bar, and a Cancel lands within a poll
+				// interval instead of after Ghidra's whole run over the library.
+				AnalysisWatch watch = new AnalysisWatch() {
+					@Override
+					public boolean cancelled() {
+						return stop.get();
+					}
+
+					@Override
+					public void onStatus(String status, int completed, int total, String message) {
+						report(progress, new Progress(libIndex, libCount, libName, "analyzing",
+								completed, total,
+								message != null && !message.isEmpty() ? message : status));
+					}
+				};
 				try {
-					analyzer.ensureAnalyzed(lib.soId());
+					analyzer.ensureAnalyzed(lib.soId(), watch);
 				} catch (Exception e) {
+					if (stop.get()) {
+						// the watch asked for this stop: a cancelled run, not a failed library
+						wasCancelled = true;
+						break;
+					}
 					String why = "analysis failed: " + messageOf(e);
 					problems.add(libName + " — " + why);
-					results.add(new LibraryResult(libName, 0, 0, 0, why));
+					LibraryResult failed = new LibraryResult(libName, 0, 0, 0, why);
+					results.add(failed);
+					reportLibrary(progress, i, failed);
 					continue;
 				}
 				if (stop.get()) {
 					wasCancelled = true;
 					break;
 				}
-				report(progress, new Progress(i, libCount, libName, "exporting", 0, 0));
+				report(progress, new Progress(i, libCount, libName, "exporting", 0, 0, null));
 				// One reserved name per library: a folder in the split layout, a file base in
 				// the single-file one -- either way collisions are handled once, at the root.
 				String targetName = libraryDirs.reserve(sanitizeFileName(libName));
 				LibraryResult r = exportLibrary(root, targetName, lib, i, libCount, options, stop,
 						progress, problems);
 				results.add(r);
+				reportLibrary(progress, i, r);
 				filesTotal += r.filesWritten();
 				functionsTotal += r.functions();
 				failedTotal += r.failedFunctions();
@@ -353,6 +433,7 @@ public final class ProjectExporter {
 
 		int total = functions.size();
 		int done = 0;
+		int crashed = 0;
 		for (Map.Entry<String, List<FunctionRef>> entry : byGroup.entrySet()) {
 			if (stop.get()) {
 				break;
@@ -361,16 +442,24 @@ public final class ProjectExporter {
 				if (stop.get()) {
 					break;
 				}
-				sink.accept(f, entry.getKey());
+				try {
+					sink.accept(f, entry.getKey());
+				} catch (RuntimeException e) {
+					// nothing should get this far -- every bridge error and every write error is
+					// handled on the spot -- but "one broken function never stops a run" has to
+					// hold even against a surprise, so count it, record it, and carry on.
+					problems.add(libName + "/" + f.name + " — " + messageOf(e));
+					crashed++;
+				}
 				done++;
-				report(progress, new Progress(libIndex, libCount, libName, "exporting", done, total));
+				report(progress, new Progress(libIndex, libCount, libName, "exporting", done, total, null));
 			}
 		}
 		int files = sink.finish(done, total);
 		if (done < total) {
 			problems.add(libName + " — cancelled after " + done + " of " + total + " functions");
 		}
-		return new LibraryResult(libName, total, files, sink.failures(), null);
+		return new LibraryResult(libName, total, files, sink.failures() + crashed, null);
 	}
 
 	/** Receives a library's functions in tree order; see {@link #exportLibrary}. */
@@ -449,9 +538,11 @@ public final class ProjectExporter {
 	/**
 	 * Single-file layout: one {@code <library>.c} / {@code <library>.asm} holding every function
 	 * in the tree's order, each behind a banner header (symbol, address, group) so the file still
-	 * carries the structure the split layout expresses with folders. Holds the content in memory
-	 * until {@link #finish}, where one write per view keeps a partial export honest instead of
-	 * half-written.
+	 * carries the structure the split layout expresses with folders. Streams each view straight
+	 * into a {@code .part} temp file as functions arrive -- nothing accumulates in memory, which
+	 * matters on the libraries where the single file runs to megabytes -- and moves the finished
+	 * file into place in {@link #finish}, so neither a failure nor a cancel ever leaves a
+	 * half-written {@code .c} that looks like a complete export.
 	 */
 	private final class SingleSink implements FunctionSink {
 		private final Path root;
@@ -461,9 +552,10 @@ public final class ProjectExporter {
 		private final Options options;
 		private final List<String> problems;
 		private final Set<String> external;
-		private final StringBuilder pseudo = new StringBuilder();
-		private final StringBuilder disasm = new StringBuilder();
+		/** One streaming writer per requested view, opened on first use; keys are extensions. */
+		private final Map<String, BufferedWriter> writers = new HashMap<>();
 		private int failures;
+		private boolean ioFailed;
 
 		SingleSink(Path root, String targetName, String soId, String libName, Options options,
 				List<String> problems, Set<String> external) {
@@ -478,60 +570,150 @@ public final class ProjectExporter {
 
 		@Override
 		public void accept(FunctionRef f, String group) {
+			if (ioFailed) {
+				return; // the disk gave up earlier; that failure is already recorded
+			}
 			// The listing's external flag decides first (same routing the split layout uses):
 			// an import has no body here, so there is nothing worth fetching.
 			Views v = external.contains(f.name)
 					? new Views(null, null, true, false)
 					: fetchViews(soId, libName, f, options, problems);
-			if (options.pseudocode()) {
-				banner(pseudo, f, group, libName, "//");
-				if (v.external()) {
-					pseudo.append("// Imported by ").append(libName)
-							.append(" — linked in from another library, so this APK's copy has no body.\n\n");
-				} else if (v.pseudo() == null) {
-					pseudo.append("// (pseudocode unavailable — see ").append(MANIFEST_NAME).append(")\n\n");
-				} else {
-					pseudo.append(v.pseudo()).append("\n\n");
-				}
-			}
-			if (options.disassembly()) {
-				banner(disasm, f, group, libName, ";");
-				if (v.external()) {
-					disasm.append("; Imported by ").append(libName)
-							.append(" — linked in from another library, so this APK's copy has no body.\n\n");
-				} else if (v.disasm() == null) {
-					disasm.append("; (disassembly unavailable — see ").append(MANIFEST_NAME).append(")\n\n");
-				} else {
-					disasm.append(v.disasm()).append("\n\n");
-				}
-			}
 			if (!v.external() && v.failed()) {
 				failures++; // one failed function, however many of its views were requested
 			}
+			try {
+				if (options.pseudocode()) {
+					Writer w = writer(PSEUDO_EXT);
+					banner(w, f, group, libName, "//");
+					if (v.external()) {
+						w.write("// Imported by " + libName
+								+ " — linked in from another library, so this APK's copy has no body.\n\n");
+					} else if (v.pseudo() == null) {
+						w.write("// (pseudocode unavailable — see " + MANIFEST_NAME + ")\n\n");
+					} else {
+						w.write(v.pseudo());
+						w.write("\n\n");
+					}
+				}
+				if (options.disassembly()) {
+					Writer w = writer(DISASM_EXT);
+					banner(w, f, group, libName, ";");
+					if (v.external()) {
+						w.write("; Imported by " + libName
+								+ " — linked in from another library, so this APK's copy has no body.\n\n");
+					} else if (v.disasm() == null) {
+						w.write("; (disassembly unavailable — see " + MANIFEST_NAME + ")\n\n");
+					} else {
+						w.write(v.disasm());
+						w.write("\n\n");
+					}
+				}
+			} catch (IOException e) {
+				ioFailed = true;
+				failures++; // this function's content did not make it out
+				problems.add(libName + " — could not write " + targetName + ": " + e.getMessage());
+				closeAll();
+				deleteTemps();
+			}
+		}
+
+		/** The requested view's streaming writer into its {@code .part} temp file. */
+		private Writer writer(String ext) throws IOException {
+			BufferedWriter w = writers.get(ext);
+			if (w == null) {
+				Files.createDirectories(root);
+				w = Files.newBufferedWriter(root.resolve(targetName + ext + PART_SUFFIX),
+						StandardCharsets.UTF_8);
+				writers.put(ext, w);
+			}
+			return w;
 		}
 
 		@Override
 		public int finish(int done, int total) {
 			int written = 0;
-			if (done < total) {
-				partialNote(pseudo, done, total, "//");
-				partialNote(disasm, done, total, ";");
+			// A run stopped before its first function has nothing worth keeping: no files at all,
+			// rather than empty ones that pretend to be an export.
+			if (done > 0 && !ioFailed) {
+				if (done < total) {
+					appendNote(PSEUDO_EXT, "//", done, total);
+					appendNote(DISASM_EXT, ";", done, total);
+				}
+				closeAll(); // before the move: Windows cannot move a file that is still open
+				if (options.pseudocode()) {
+					written += moveIntoPlace(PSEUDO_EXT);
+				}
+				if (options.disassembly()) {
+					written += moveIntoPlace(DISASM_EXT);
+				}
+			} else {
+				closeAll();
 			}
-			if (options.pseudocode()) {
-				written += writeView(PSEUDO_EXT, pseudo.toString());
-			}
-			if (options.disassembly()) {
-				written += writeView(DISASM_EXT, disasm.toString());
+			if (ioFailed) {
+				deleteTemps();
 			}
 			return written;
 		}
 
-		private int writeView(String ext, String content) {
-			if (write(root.resolve(targetName + ext), content) == 0) {
-				problems.add(libName + " — could not write " + targetName + ext);
+		/** The trailing "cancelled" note, if that view got as far as a writer at all. */
+		private void appendNote(String ext, String comment, int done, int total) {
+			Writer w = writers.get(ext);
+			if (w == null) {
+				return;
+			}
+			try {
+				partialNote(w, done, total, comment);
+			} catch (IOException e) {
+				problems.add(libName + " — could not finish " + targetName + ext + ": " + e.getMessage());
+			}
+		}
+
+		/** Close the temp file into its final name; 0 (with the reason recorded) on failure. */
+		private int moveIntoPlace(String ext) {
+			String name = targetName + ext;
+			Path tmp = root.resolve(name + PART_SUFFIX);
+			if (!Files.exists(tmp)) {
+				return 0; // no function ever wrote to this view
+			}
+			Path target = root.resolve(name);
+			try {
+				try {
+					Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING,
+							StandardCopyOption.ATOMIC_MOVE);
+				} catch (AtomicMoveNotSupportedException e) {
+					Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+				}
+				return 1;
+			} catch (IOException e) {
+				problems.add(libName + " — could not write " + name + ": " + e.getMessage());
+				failures++;
+				deleteTemp(ext);
 				return 0;
 			}
-			return 1;
+		}
+
+		private void closeAll() {
+			for (Writer w : writers.values()) {
+				try {
+					w.close();
+				} catch (IOException e) {
+					// nothing sensible to do here; a close failure surfaces as a missing move
+				}
+			}
+		}
+
+		private void deleteTemps() {
+			for (String ext : List.copyOf(writers.keySet())) {
+				deleteTemp(ext);
+			}
+		}
+
+		private void deleteTemp(String ext) {
+			try {
+				Files.deleteIfExists(root.resolve(targetName + ext + PART_SUFFIX));
+			} catch (IOException e) {
+				// best effort: a leftover .part is noise, never mistaken for exported output
+			}
 		}
 
 		@Override
@@ -541,27 +723,24 @@ public final class ProjectExporter {
 	}
 
 	/** One banner per function in the single-file layout; {@code comment} is "//" (C) or ";" (asm). */
-	private static void banner(StringBuilder b, FunctionRef f, String group, String libName,
-			String comment) {
+	private static void banner(Writer b, FunctionRef f, String group, String libName,
+			String comment) throws IOException {
 		String rule = comment + " ============================================================\n";
-		b.append(rule);
-		b.append(comment).append(' ').append(f.name);
+		b.write(rule);
+		b.write(comment + ' ' + f.name);
 		if (f.address != null && !f.address.isEmpty()) {
-			b.append(" @ ").append(f.address);
+			b.write(" @ " + f.address);
 		}
-		b.append('\n');
-		b.append(comment).append(" Group: ").append(group).append(" | Library: ").append(libName)
-				.append('\n');
-		b.append(rule).append('\n');
+		b.write('\n');
+		b.write(comment + " Group: " + group + " | Library: " + libName + '\n');
+		b.write(rule);
+		b.write('\n');
 	}
 
 	/** Trailing honesty note when a single file holds fewer functions than the library listed. */
-	private static void partialNote(StringBuilder b, int done, int total, String comment) {
-		if (b.length() == 0) {
-			return;
-		}
-		b.append(comment).append(" … export cancelled: only ").append(done).append(" of ")
-				.append(total).append(" functions are included here.\n");
+	private static void partialNote(Writer b, int done, int total, String comment) throws IOException {
+		b.write(comment + " … export cancelled: only " + done + " of "
+				+ total + " functions are included here.\n");
 	}
 
 	/** Files written, and how many of the selected contents could not be fetched at all. */
@@ -829,6 +1008,28 @@ public final class ProjectExporter {
 		if (listener != null) {
 			listener.onProgress(p);
 		}
+	}
+
+	private static void reportLibrary(ProgressListener listener, int index, LibraryResult r) {
+		if (listener != null) {
+			listener.onLibraryDone(index, r);
+		}
+	}
+
+	/**
+	 * The folder one run writes into, inside the folder the user picked: a fresh
+	 * {@code Jexray Export yyyy-MM-dd HH.mm.ss} subfolder, so exporting into a shared folder can
+	 * never overwrite an earlier run or leave its stale files mixed in with this one's -- every
+	 * run is a self-contained snapshot. Collisions (two exports in one second) get a {@code (2)}
+	 * suffix rather than sharing a folder.
+	 */
+	public static Path newRunDir(Path chosen) {
+		String stamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH.mm.ss"));
+		Path candidate = chosen.resolve("Jexray Export " + stamp);
+		for (int n = 2; Files.exists(candidate); n++) {
+			candidate = chosen.resolve("Jexray Export " + stamp + " (" + n + ")");
+		}
+		return candidate;
 	}
 
 	private static Set<String> safe(Set<String> s) {
