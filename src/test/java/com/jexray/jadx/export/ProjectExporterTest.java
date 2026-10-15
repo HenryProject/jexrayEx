@@ -55,7 +55,7 @@ class ProjectExporterTest {
 		// linked in from elsewhere
 		src.add("so1", "ext_memcmp", true);
 
-		Result r = run(src, soId -> { }, split(temp, true, true), List.of(new Library("so1", "libfake.so")));
+		Result r = run(src, (soId, watch) -> { }, split(temp, true, true), List.of(new Library("so1", "libfake.so")));
 
 		assertFalse(r.cancelled());
 		assertEquals(0, r.failedFunctions());
@@ -86,7 +86,7 @@ class ProjectExporterTest {
 		src.add("so1", "FUN_001234", false); // obfuscated, but registered to a Java method
 		src.registered("so1", "FUN_001234");
 
-		run(src, soId -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
+		run(src, (soId, watch) -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
 
 		assertTrue(Files.exists(temp.resolve("libfake.so").resolve("JNI methods").resolve("FUN_001234.c")));
 	}
@@ -98,7 +98,7 @@ class ProjectExporterTest {
 		src.add("so1", "helper", false);
 		src.add("so1", "ext_open", true);
 
-		run(src, soId -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
+		run(src, (soId, watch) -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
 
 		try (Stream<Path> walk = Files.walk(temp)) {
 			assertTrue(walk.noneMatch(p -> p.getFileName().toString().endsWith(".asm")),
@@ -116,7 +116,7 @@ class ProjectExporterTest {
 		src.add("so1", "CON", false);   // a Windows device name: not a legal file name
 		src.add("so1", "trailing.", false);
 
-		Result r = run(src, soId -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
+		Result r = run(src, (soId, watch) -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
 
 		Path functions = temp.resolve("libfake.so").resolve("Functions");
 		assertTrue(Files.exists(functions.resolve("a_b.c")));
@@ -147,7 +147,7 @@ class ProjectExporterTest {
 		src.add("so1", "good_two", false);
 		src.failPseudo("broken_one");
 
-		Result r = run(src, soId -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
+		Result r = run(src, (soId, watch) -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
 
 		assertEquals(1, r.failedFunctions());
 		assertTrue(r.problems().stream().anyMatch(p -> p.contains("broken_one")));
@@ -166,7 +166,7 @@ class ProjectExporterTest {
 		src.add("so1", "looks_defined", false); // listing claims a body...
 		src.externalFromBridge("looks_defined"); // ...the bridge says otherwise
 
-		Result r = run(src, soId -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
+		Result r = run(src, (soId, watch) -> { }, split(temp, true, false), List.of(new Library("so1", "libfake.so")));
 
 		assertEquals(0, r.failedFunctions());
 		assertTrue(read(temp.resolve("libfake.so").resolve("Functions").resolve("looks_defined.c"))
@@ -179,7 +179,7 @@ class ProjectExporterTest {
 		src.add("soA", "Java_a_b_c", false);
 		src.add("soB", "helper", false);
 
-		Result r = run(src, soId -> {
+		Result r = run(src, (soId, watch) -> {
 			if ("soA".equals(soId)) {
 				throw new IOException("no native library found for id soA");
 			}
@@ -200,7 +200,7 @@ class ProjectExporterTest {
 		FakeSource src = new FakeSource();
 		src.add("so1", "helper", false);
 
-		Result r = run(src, soId -> { }, split(temp, true, true),
+		Result r = run(src, (soId, watch) -> { }, split(temp, true, true),
 				List.of(new Library("so1", "libfake.so")), new AtomicBoolean(true));
 
 		assertTrue(r.cancelled());
@@ -212,12 +212,101 @@ class ProjectExporterTest {
 	}
 
 	@Test
+	void cancellingDuringAnalysisIsACancelledRunNotAFailedLibrary() throws Exception {
+		FakeSource src = new FakeSource();
+		src.add("so1", "helper", false);
+		AtomicBoolean cancel = new AtomicBoolean(false);
+		List<Progress> seen = new ArrayList<>();
+		// mimics the real bridge-backed analyzer: the analysis reports counts, the user presses
+		// Cancel while Ghidra is still working, the watch sees the flag, and the call ends in an
+		// InterruptedException -- exactly what ensureBridgeLoaded does on a cancelled watch
+		ProjectExporter.Analyzer an = (soId, watch) -> {
+			watch.onStatus("analyzing", 10, 100, "Analyzing functions");
+			cancel.set(true);
+			assertTrue(watch.cancelled(), "the watch must observe the run's cancelled flag");
+			throw new InterruptedException("cancelled");
+		};
+
+		Result r = exporter(src, an).run(split(temp, true, false),
+				List.of(new Library("so1", "libfake.so")), cancel, seen::add);
+
+		assertTrue(r.cancelled());
+		assertTrue(r.problems().isEmpty(), r.problems().toString());
+		assertEquals(0, r.libraryResults().size()); // the stopped library is not a failure
+		assertFalse(r.isClean());
+		assertTrue(r.summary().startsWith("Export cancelled"), r.summary());
+		assertTrue(read(temp.resolve(ProjectExporter.MANIFEST_NAME)).contains("CANCELLED"));
+		try (Stream<Path> walk = Files.walk(temp)) {
+			assertTrue(walk.noneMatch(p -> p.getFileName().toString().endsWith(".c")));
+		}
+		// the analysis phase carried the bridge's own counts, so it can drive a determinate bar
+		assertTrue(seen.stream().anyMatch(p -> "analyzing".equals(p.phase())
+				&& p.doneFunctions() == 10 && p.totalFunctions() == 100
+				&& p.overallPercent() == 10), seen.toString());
+	}
+
+	@Test
+	void cleanIsTrueOnlyWhenNothingWentWrongAnywhere() throws Exception {
+		FakeSource src = new FakeSource();
+		src.add("so1", "helper", false);
+
+		// a perfect run: the only shape that may auto-close the dialog
+		assertTrue(run(src, (soId, watch) -> { }, split(temp, true, false),
+				List.of(new Library("so1", "libfake.so"))).isClean());
+
+		// one failed function -- even with every library exported fine -- is not clean
+		FakeSource broken = new FakeSource();
+		broken.add("so1", "bad", false);
+		broken.failPseudo("bad");
+		assertFalse(run(broken, (soId, watch) -> { }, split(temp, true, false),
+				List.of(new Library("so1", "libfake.so"))).isClean());
+
+		// a failed library is not clean
+		assertFalse(run(src, (soId, watch) -> { throw new IOException("boom"); },
+				split(temp, true, false), List.of(new Library("so1", "libfake.so"))).isClean());
+	}
+
+	@Test
+	void aRunLevelFailureIsNotCleanEvenWithAnEmptyLibraryList() throws Exception {
+		FakeSource src = new FakeSource();
+		src.add("so1", "helper", false);
+		// an output root that cannot be created: the file that is in the way -- exactly the
+		// "can't create the output folder" case, whose empty library list used to read as clean
+		Path blocked = temp.resolve("blocked");
+		Files.writeString(blocked, "in the way");
+
+		Result r = run(src, (soId, watch) -> { },
+				new Options(blocked.resolve("out"), true, false),
+				List.of(new Library("so1", "libfake.so")));
+
+		assertFalse(r.isClean(), "an unwritable root must never read as a clean run");
+		assertTrue(r.libraryResults().isEmpty());
+		assertTrue(r.problems().stream().anyMatch(p -> p.contains("could not write")),
+				r.problems().toString());
+	}
+
+	@Test
+	void newRunDirGivesEveryRunItsOwnSubfolder() throws Exception {
+		Path first = ProjectExporter.newRunDir(temp);
+		assertTrue(first.getFileName().toString().startsWith("Jexray Export "),
+				first.getFileName().toString());
+		assertEquals(temp, first.getParent());
+
+		// a second export into the same shared folder lands beside the first, never on top of it
+		Files.createDirectories(first);
+		Path second = ProjectExporter.newRunDir(temp);
+		assertTrue(Files.notExists(second));
+		assertTrue(second.getFileName().toString().contains("("),
+				second.getFileName().toString());
+	}
+
+	@Test
 	void progressReportsTheTreesPhasePerLibrary() throws Exception {
 		FakeSource src = new FakeSource();
 		src.add("so1", "helper", false);
 		List<Progress> seen = new ArrayList<>();
 
-		ProjectExporter exporter = exporter(src, soId -> { });
+		ProjectExporter exporter = exporter(src, (soId, watch) -> { });
 		exporter.run(split(temp, true, false), List.of(new Library("so1", "libfake.so")),
 				new AtomicBoolean(false), seen::add);
 
@@ -239,7 +328,7 @@ class ProjectExporterTest {
 		src.add("so1", "helper", false);
 		src.add("so1", "ext_open", true);
 
-		Result r = run(src, soId -> { }, single(temp, true, true), List.of(new Library("so1", "libfake.so")));
+		Result r = run(src, (soId, watch) -> { }, single(temp, true, true), List.of(new Library("so1", "libfake.so")));
 
 		assertFalse(r.cancelled());
 		assertEquals(0, r.failedFunctions());
@@ -258,6 +347,10 @@ class ProjectExporterTest {
 		assertTrue(read(asm).contains("; Group: JNI methods | Library: libfake.so"), asm.toString());
 		// nothing was split out into folders or per-function files
 		assertFalse(Files.exists(temp.resolve("libfake.so")));
+		// the streaming temps are gone: only the finished files remain
+		try (Stream<Path> walk = Files.walk(temp)) {
+			assertTrue(walk.noneMatch(p -> p.getFileName().toString().endsWith(".part")));
+		}
 		String manifest = read(temp.resolve(ProjectExporter.MANIFEST_NAME));
 		assertTrue(manifest.contains("single file per library"), manifest);
 	}
@@ -275,7 +368,7 @@ class ProjectExporterTest {
 		src.add("so1", "zzz_second", false);
 		AtomicBoolean cancel = new AtomicBoolean(false);
 
-		ProjectExporter exporter = exporter(src, soId -> { });
+		ProjectExporter exporter = exporter(src, (soId, watch) -> { });
 		// the listener fires after each function, so the second one is dropped mid-library
 		Result r = exporter.run(single(temp, true, false), List.of(new Library("so1", "libfake.so")),
 				cancel, p -> {
@@ -291,6 +384,29 @@ class ProjectExporterTest {
 		assertFalse(text.contains("zzz_second"), text);
 		assertTrue(text.contains("export cancelled"), text);
 		assertTrue(text.contains("only 1 of 2 functions"), text);
+	}
+
+	@Test
+	void aCancelBeforeTheFirstFunctionLeavesNoEmptySingleFiles() throws Exception {
+		FakeSource src = new FakeSource();
+		src.add("so1", "helper", false);
+		AtomicBoolean cancel = new AtomicBoolean(false);
+
+		// cancel right at the exporting phase's first report: the library gets listed but not a
+		// single function is fetched -- the streamed layout must leave nothing behind, not even
+		// empty files pretending to be an export
+		Result r = exporter(src, (soId, watch) -> { }).run(single(temp, true, true),
+				List.of(new Library("so1", "libfake.so")), cancel,
+				p -> { if ("exporting".equals(p.phase())) cancel.set(true); });
+
+		assertTrue(r.cancelled());
+		assertEquals(0, r.filesWritten());
+		try (Stream<Path> walk = Files.walk(temp)) {
+			assertTrue(walk.noneMatch(q -> {
+				String n = q.getFileName().toString();
+				return n.endsWith(".part") || n.endsWith(".c") || n.endsWith(".asm");
+			}), "nothing was exported, so nothing must be left on disk");
+		}
 	}
 
 	// -------------------------------------------------------------- harness
