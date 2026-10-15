@@ -54,10 +54,12 @@ import com.jexray.jadx.bridge.LoadDeadline;
 import com.jexray.jadx.bridge.PrewarmProgress;
 import com.jexray.jadx.bridge.PrewarmProgress.LibState;
 import com.jexray.jadx.apk.LoadedLibrariesModel;
+import com.jexray.jadx.export.ProjectExporter;
 import com.jexray.jadx.ghidra.EmbeddedGhidraBridge;
 import com.jexray.jadx.nav.SyncDebouncer;
 import com.jexray.jadx.symbols.NativeSymbols;
 import com.jexray.jadx.ui.CacheDialog;
+import com.jexray.jadx.ui.ExportDialog;
 import com.jexray.jadx.ui.JexrayIcons;
 import com.jexray.jadx.ui.LibraryEntry;
 import com.jexray.jadx.ui.LibraryTreePanel;
@@ -215,6 +217,10 @@ public class JexrayPlugin implements JadxPlugin {
 		// window) so browsing is instant once the user asks for it -- but without popping the
 		// All Functions picker open uninvited; just show the dialog with a ready/progress state.
 		gui.addMenuAction("Jexray - Open Native View", () -> gui.uiRun(this::openNativeViewEager));
+		// The same export the Native View toolbar's "Export…" button offers, reachable straight
+		// from jadx's own menu -- so a whole-project export never requires opening the dialog
+		// (or even having a native method in view) first.
+		gui.addMenuAction("Jexray - Export Project", () -> gui.uiRun(this::showExportProject));
 	}
 
 	@Override
@@ -1137,6 +1143,8 @@ public class JexrayPlugin implements JadxPlugin {
 					this::showXrefs,
 					// Loaded Libraries: which .so's the app asks the VM to load (Native-View-only)
 					this::showLoadedLibraries,
+					// Export Project: every library out to disk as a browsable project
+					this::showExportProject,
 					// jadx's own SVG icons (null under CLI / when unavailable -> text-only buttons).
 					// Routed through a source that checks jadx's resources before asking, so a
 					// candidate name this jadx does not ship is skipped rather than reported as an
@@ -1594,6 +1602,112 @@ public class JexrayPlugin implements JadxPlugin {
 			LOG.warn("Cache clear failed", e);
 			getOrCreateDialog(context.getGuiContext()).flashStatus("Cache clear failed: " + e.getMessage());
 		}
+	}
+
+	/**
+	 * "Export Project" (Native View toolbar "Export…", or the jadx menu): write the selected
+	 * native libraries out to a chosen folder as a browsable project (the dialog lists every
+	 * library, checked by default -- excluding is a matter of unchecking) -- either one file per
+	 * library (default) or, in the split layout, one folder per library mirroring the All Functions
+	 * tree's exact groups ({@code JNI methods}/{@code Functions}/{@code Exports}/
+	 * {@code Imports}) with one file per function, holding its Ghidra pseudocode ({@code .c})
+	 * and/or disassembly ({@code .asm}). See {@link ProjectExporter}.
+	 *
+	 * <p>Libraries not yet analyzed are analyzed on the way past (same
+	 * {@link #ensureBridgeLoaded} the browse path uses, so anything already warm -- in this
+	 * session or in the disk cache -- costs nothing), and one library's failure never stops the
+	 * rest; the manifest says what did and didn't make it out.
+	 */
+	private void showExportProject() {
+		JadxGuiContext gui = context.getGuiContext();
+		JFrame parent = gui == null ? null : gui.getMainFrame();
+		NativeViewDialog d = getOrCreateDialog(gui);
+		SoManager mgr = getSoManager();
+		if (!mgr.hasNativeLibraries()) {
+			d.flashStatus("No native library (lib/*/*.so) found in the loaded input — nothing to export.");
+			return;
+		}
+		Map<String, String> names = mgr.soIdToName();
+		List<ProjectExporter.Library> libs = new ArrayList<>();
+		for (String soId : mgr.soIds()) {
+			libs.add(new ProjectExporter.Library(soId, names.getOrDefault(soId, soId)));
+		}
+		// Read now, on the EDT: the bridge may still be starting up, and this is only a label.
+		String ghidraVersion = currentGhidraVersion();
+		ExportDialog dialog = new ExportDialog(parent, libs,
+				(selected, options, cancelled, dlg) -> {
+			Thread worker = new Thread(() -> {
+				ProjectExporter.Result result;
+				try {
+					GhidraBridgeClient client = new GhidraBridgeClient(resolveBridgeUrl());
+					ProjectExporter exporter = new ProjectExporter(PluginVersion.get(), ghidraVersion,
+							exportFunctionSource(client),
+							// null dialog: analysis progress belongs to the export window (its own
+							// "analyzing" phase), not to the Native View's lock overlay
+							soId -> ensureBridgeLoaded(client, soId, null));
+					result = exporter.run(options, selected, cancelled, dlg::progress);
+				} catch (RuntimeException e) {
+					// An unexpected explosion must not leave the dialog spinning on "Preparing…"
+					// forever; report it as a failed run (a failed run keeps the window open,
+					// so the message is readable there).
+					LOG.warn("Export run failed", e);
+					result = new ProjectExporter.Result(false, 0, 0, 0, selected, List.of(),
+							List.of("Export failed: " + e), options.rootDir());
+				}
+				dlg.finished(result);
+				// the same sentence in the Native View's status bar, for whoever left it open
+				getOrCreateDialog(gui).flashStatus(result.summary());
+			}, "jexray-export");
+			worker.setDaemon(true);
+			worker.start();
+		});
+		dialog.setVisible(true);
+	}
+
+	/**
+	 * {@link ProjectExporter.FunctionSource} over the bridge, plus the same two local symbol reads
+	 * the All Functions tree groups by ({@link #dynamicExportsOf},
+	 * {@link #registeredSymbolsOf}) -- so the exported folders land under exactly the headings the
+	 * tree shows, for the same reasons.
+	 */
+	private ProjectExporter.FunctionSource exportFunctionSource(GhidraBridgeClient client) {
+		return new ProjectExporter.FunctionSource() {
+			@Override
+			public List<FunctionRef> listFunctions(String soId) throws BridgeException, InterruptedException {
+				// empty query returns every function (substring match against "") -- same call
+				// loadFunctionsAndShowPicker makes for the All Functions tree
+				SearchResult res = client.search(soId, "");
+				List<FunctionRef> out = new ArrayList<>();
+				if (res.functions != null) {
+					for (FunctionRef f : res.functions) {
+						if (f != null && f.name != null) {
+							out.add(f);
+						}
+					}
+				}
+				return out;
+			}
+
+			@Override
+			public String pseudocode(String soId, String name) throws BridgeException, InterruptedException {
+				return client.decompile(soId, name).pseudocode;
+			}
+
+			@Override
+			public String disassembly(String soId, String name) throws BridgeException, InterruptedException {
+				return client.disassemble(soId, name).disassembly;
+			}
+
+			@Override
+			public Set<String> exportedSymbols(String soId) {
+				return dynamicExportsOf(soId);
+			}
+
+			@Override
+			public Set<String> registeredSymbols(String soId) {
+				return registeredSymbolsOf(client, soId);
+			}
+		};
 	}
 
 	/**
