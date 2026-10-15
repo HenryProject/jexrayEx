@@ -35,6 +35,7 @@ import javax.swing.JScrollPane;
 import javax.swing.JTextField;
 import javax.swing.KeyStroke;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
 
 import com.jexray.jadx.export.ProjectExporter;
@@ -48,19 +49,23 @@ import com.jexray.jadx.export.ProjectExporter.Layout;
  * function ({@link Layout#SPLIT}) -- and check which libraries to export: every library found in
  * the APK is listed and checked by default, so exporting a subset is a matter of unchecking the
  * rest. Either way each file holds Ghidra pseudocode ({@code .c}) and/or disassembly ({@code .asm}),
- * UTF-8.
+ * UTF-8, written into a fresh timestamped subfolder of the chosen one ({@link
+ * ProjectExporter#newRunDir}) -- so exporting into a shared folder can never overwrite an earlier
+ * run or leave its stale files mixed in with this run's.
  *
  * <p>Owns only the UI: the actual export runs on a worker thread the caller starts when
- * {@link Runner#start} is handed the choices, and reports back through {@link #progress} and
- * {@link #finished} (callable from any thread -- both hop to the EDT themselves). While an export
- * is running the dialog cannot be dismissed by accident: closing it (or Escape) asks the run to
- * cancel instead, and the run stays cancellable between any two functions. A clean run closes the
- * dialog itself the moment it finishes (honouring the optional "open the export folder when
- * finished" checkbox on the way out -- the same summary is also flashed in the Native View's status
- * bar); a cancelled or partly failed run stays open, so what did and didn't make it out can
- * actually be read there.
+ * {@link Runner#start} is handed the choices, and reports back through {@link #onProgress},
+ * {@link #onLibraryDone} and {@link #finished} (all callable from any thread -- they hop to the
+ * EDT themselves). The dialog is <b>non-modal</b>: jadx stays fully usable while an export runs.
+ * Closing it (or Escape) asks the run to cancel instead of orphaning it -- cancellation takes
+ * effect between any two functions <b>and</b> while a library is still being analyzed. A clean
+ * run -- and only a run where nothing failed at all -- closes the dialog itself the moment it
+ * finishes (honouring the optional "open the export folder when finished" checkbox on the way
+ * out -- the same summary is also flashed in the Native View's status bar); a cancelled run
+ * brings the options back so the export can simply be retried, and a partly failed one stays
+ * open on its summary, so what did and didn't make it out can actually be read there.
  */
-public class ExportDialog extends JDialog {
+public class ExportDialog extends JDialog implements ProjectExporter.ProgressListener {
 
 	private static final long serialVersionUID = 1L;
 
@@ -87,6 +92,16 @@ public class ExportDialog extends JDialog {
 	private final JButton cancelExportButton = new JButton("Cancel Export");
 	private final JButton openFolderButton = new JButton("Open Folder");
 	private final JButton closeButton = new JButton("Close");
+	/** One status row per selected library, same order as the run's list. */
+	private final List<JLabel> statusRows = new ArrayList<>();
+	private final JPanel libStatusList = new JPanel();
+	private final JLabel elapsedLabel = new JLabel(" ");
+	private final JLabel lastRunLabel = new JLabel(" ");
+	/** Ticks once a second while a run is going, so the elapsed line keeps counting even while
+	 * Ghidra analysis emits no progress events. */
+	private final Timer elapsedTimer = new Timer(1000, e -> updateElapsed());
+	/** Which rows already reached a final outcome; the rest are marked "not exported" at the end. */
+	private boolean[] rowFinalized = new boolean[0];
 
 	private final JLabel libCountLabel = new JLabel(" ");
 	private final java.awt.Color defaultLibCountColor = libCountLabel.getForeground();
@@ -100,13 +115,18 @@ public class ExportDialog extends JDialog {
 
 	private volatile boolean running;
 	private Path resultDir;
+	private long runStartedAt;
+	/** Highest overall percentage shown this run; the bar never runs backwards. */
+	private int barMax;
 
 	public ExportDialog(JFrame parent, List<ProjectExporter.Library> libraries, Runner runner) {
 		this(parent, libraries, runner, new UiPrefs());
 	}
 
 	ExportDialog(JFrame parent, List<ProjectExporter.Library> libraries, Runner runner, UiPrefs prefs) {
-		super(parent, "Jexray - Export Project", true);
+		// non-modal on purpose: an export can take an hour across a big APK, and jadx must stay
+		// usable throughout -- the toolbar just raises this window again if it is already open
+		super(parent, "Jexray - Export Project", false);
 		this.runner = runner;
 		this.prefs = prefs;
 		this.libraries = libraries;
@@ -219,10 +239,17 @@ public class ExportDialog extends JDialog {
 				+ "ones can take a while. Errors never abort the export; every detail is "
 				+ "recorded in <b>jexray-project.txt</b> inside the export folder.</html>");
 		note.setEnabled(false);
-		JPanel south = new JPanel(new BorderLayout(0, 4));
+		// "Last run" carries the previous run's outcome when the options come back after a
+		// cancel, so a retry starts knowing exactly what the last attempt did and didn't write.
+		lastRunLabel.setAlignmentX(LEFT_ALIGNMENT);
+		openWhenDoneCheck.setAlignmentX(LEFT_ALIGNMENT);
+		note.setAlignmentX(LEFT_ALIGNMENT);
+		JPanel south = new JPanel();
 		south.setOpaque(false);
-		south.add(openWhenDoneCheck, BorderLayout.NORTH);
-		south.add(note, BorderLayout.SOUTH);
+		south.setLayout(new BoxLayout(south, BoxLayout.Y_AXIS));
+		south.add(lastRunLabel);
+		south.add(openWhenDoneCheck);
+		south.add(note);
 
 		JPanel options = new JPanel(new BorderLayout(0, 8));
 		options.setBorder(new EmptyBorder(0, 0, 8, 0));
@@ -242,6 +269,16 @@ public class ExportDialog extends JDialog {
 		cancelExportButton.addActionListener(e -> requestCancel());
 		progressLabel.setAlignmentX(LEFT_ALIGNMENT);
 		bar.setAlignmentX(LEFT_ALIGNMENT);
+		elapsedLabel.setEnabled(false);
+		elapsedLabel.setAlignmentX(LEFT_ALIGNMENT);
+		// Per-library status: one row each, from pending through analyzing/exporting to done or
+		// failed -- so a long run says which library it is on, how far, and what already came out.
+		libStatusList.setOpaque(false);
+		libStatusList.setLayout(new BoxLayout(libStatusList, BoxLayout.Y_AXIS));
+		JScrollPane statusScroll = new JScrollPane(libStatusList);
+		statusScroll.setAlignmentX(LEFT_ALIGNMENT);
+		statusScroll.setPreferredSize(new Dimension(0, 96));
+		statusScroll.setMaximumSize(new Dimension(Integer.MAX_VALUE, 170));
 		cancelExportButton.setAlignmentX(LEFT_ALIGNMENT);
 		JPanel progress = new JPanel();
 		progress.setOpaque(false);
@@ -250,6 +287,10 @@ public class ExportDialog extends JDialog {
 		progress.add(progressLabel);
 		progress.add(Box.createVerticalStrut(8));
 		progress.add(bar);
+		progress.add(Box.createVerticalStrut(4));
+		progress.add(elapsedLabel);
+		progress.add(Box.createVerticalStrut(8));
+		progress.add(statusScroll);
 		progress.add(Box.createVerticalStrut(8));
 		progress.add(cancelExportButton);
 		progress.add(Box.createVerticalGlue());
@@ -287,6 +328,13 @@ public class ExportDialog extends JDialog {
 
 	// ------------------------------------------------------------------ run lifecycle
 
+	/** The elapsed ticker must not outlive the window (e.g. a plugin reload mid-export). */
+	@Override
+	public void dispose() {
+		elapsedTimer.stop();
+		super.dispose();
+	}
+
 	/** EDT only. Validate the choices, flip to the progress card, and hand off to the runner. */
 	private void startExport() {
 		if (running) {
@@ -312,7 +360,7 @@ public class ExportDialog extends JDialog {
 			warn("Check at least one library to export.");
 			return;
 		}
-		prefs.saveExportDir(dir.toString());
+		prefs.saveExportDir(dir.toString()); // the chosen folder, not this run's subfolder
 		prefs.saveExportLayout(selectedLayout().name());
 		prefs.saveExportOpenWhenDone(openWhenDoneCheck.isSelected());
 		running = true;
@@ -321,10 +369,19 @@ public class ExportDialog extends JDialog {
 		exportButton.setEnabled(false);
 		bar.setIndeterminate(true);
 		bar.setString("Preparing…");
+		barMax = 0;
+		lastRunLabel.setText(" ");
+		// Every run lands in its own timestamped subfolder of the chosen one: a shared folder can
+		// never lose an earlier export to an overwrite, and runs never mix stale files together.
+		Path runDir = ProjectExporter.newRunDir(dir);
+		buildStatusRows(selected);
+		runStartedAt = System.currentTimeMillis();
+		updateElapsed();
+		elapsedTimer.start();
 		progressLabel.setText("Exporting " + selected.size() + " librar"
-				+ (selected.size() == 1 ? "y" : "ies") + " to " + dir + " …");
+				+ (selected.size() == 1 ? "y" : "ies") + " to " + runDir + " …");
 		showCard("progress");
-		runner.start(selected, new ProjectExporter.Options(dir, pseudoCheck.isSelected(),
+		runner.start(selected, new ProjectExporter.Options(runDir, pseudoCheck.isSelected(),
 				disasmCheck.isSelected(), selectedLayout()), cancelled, this);
 	}
 
@@ -366,11 +423,12 @@ public class ExportDialog extends JDialog {
 	}
 
 	/**
-	 * One progress sample from the worker thread. Coalesced on the EDT: a big library reports once
-	 * per function, and re-setting an identical bar value/label would still pay a repaint each
-	 * time, so only an actual change is pushed.
+	 * One progress sample from the worker thread ({@link ProjectExporter.ProgressListener}).
+	 * Coalesced on the EDT: a big library reports once per function, and re-setting an identical
+	 * bar value/label would still pay a repaint each time, so only an actual change is pushed.
 	 */
-	public void progress(ProjectExporter.Progress p) {
+	@Override
+	public void onProgress(ProjectExporter.Progress p) {
 		onEdt(() -> {
 			int pct = p.overallPercent();
 			if (pct < 0) {
@@ -382,10 +440,15 @@ public class ExportDialog extends JDialog {
 				if (bar.isIndeterminate()) {
 					bar.setIndeterminate(false);
 				}
-				if (bar.getValue() != pct) {
-					bar.setValue(pct);
+				// monotonic: the analyzing→exporting handover dips the raw fraction for one
+				// sample (analysis finished, files not yet) -- the bar must never run backwards
+				if (pct > barMax) {
+					barMax = pct;
 				}
-				String text = pct + "%";
+				if (bar.getValue() != barMax) {
+					bar.setValue(barMax);
+				}
+				String text = barMax + "%";
 				if (!text.equals(bar.getString())) {
 					bar.setString(text);
 				}
@@ -394,13 +457,96 @@ public class ExportDialog extends JDialog {
 			if (!line.equals(progressLabel.getText())) {
 				progressLabel.setText(line);
 			}
+			markCurrentRow(p);
 		});
 	}
 
-	/** The run is over (finished, failed to run, or cancelled) -- callable from any thread. */
+	/** A library reached its final outcome ({@link ProjectExporter.ProgressListener}). */
+	@Override
+	public void onLibraryDone(int index, ProjectExporter.LibraryResult r) {
+		onEdt(() -> {
+			if (index < 0 || index >= statusRows.size()) {
+				return;
+			}
+			rowFinalized[index] = true;
+			JLabel row = statusRows.get(index);
+			if (r.failed()) {
+				row.setForeground(new java.awt.Color(220, 60, 60));
+				row.setText("✗ " + r.name() + " — " + r.error());
+				row.setToolTipText(r.error());
+			} else {
+				row.setEnabled(true);
+				String extra = r.failedFunctions() > 0
+						? " (" + r.failedFunctions() + " function"
+								+ (r.failedFunctions() == 1 ? "" : "s") + " failed)"
+						: "";
+				row.setText("✓ " + r.name() + " — " + r.functions() + " functions, "
+						+ r.filesWritten() + " files" + extra);
+			}
+		});
+	}
+
+	/** The running library's row follows the run: analyzing with the bridge's counts, then exporting. */
+	private void markCurrentRow(ProjectExporter.Progress p) {
+		if (p.libIndex() < 0 || p.libIndex() >= statusRows.size() || rowFinalized[p.libIndex()]) {
+			return;
+		}
+		JLabel row = statusRows.get(p.libIndex());
+		row.setEnabled(true);
+		if (!"exporting".equals(p.phase())) {
+			row.setText("► " + p.libraryName() + (p.totalFunctions() > 0
+					? " — analyzing " + p.doneFunctions() + " / " + p.totalFunctions()
+					: " — analyzing…"));
+		} else {
+			row.setText("► " + p.libraryName() + (p.totalFunctions() > 0
+					? " — exporting " + p.doneFunctions() + " / " + p.totalFunctions()
+					: " — listing functions…"));
+		}
+	}
+
+	/** Rows the run never finalized say so, instead of sitting gray forever. */
+	private void markUnreachedRows(boolean cancelledRun) {
+		for (int i = 0; i < statusRows.size() && i < rowFinalized.length; i++) {
+			if (!rowFinalized[i]) {
+				JLabel row = statusRows.get(i);
+				row.setEnabled(false);
+				row.setText(row.getText() + (cancelledRun ? " — not exported (cancelled)" : " — not reached"));
+			}
+		}
+	}
+
+	/** "Elapsed 1:23"; ticks from the timer while a run is going, frozen when it ends. */
+	private void updateElapsed() {
+		long s = (System.currentTimeMillis() - runStartedAt) / 1000;
+		elapsedLabel.setText("Elapsed " + (s / 60) + ":" + String.format("%02d", s % 60));
+	}
+
+	/** One gray row per selected library, in the run's order; all start out "pending". */
+	private void buildStatusRows(List<ProjectExporter.Library> selected) {
+		statusRows.clear();
+		rowFinalized = new boolean[selected.size()];
+		libStatusList.removeAll();
+		for (ProjectExporter.Library lib : selected) {
+			JLabel row = new JLabel(lib.displayName());
+			row.setToolTipText(lib.soId());
+			row.setEnabled(false); // gray until the run reaches it
+			statusRows.add(row);
+			libStatusList.add(row);
+		}
+		libStatusList.revalidate();
+		libStatusList.repaint();
+	}
+
+	/**
+	 * The run is over (finished, failed to run, or cancelled) -- callable from any thread.
+	 * A cancelled run brings the options back for a retry; a partly failed one stays open on its
+	 * summary; only a completely clean run ({@link ProjectExporter.Result#isClean()}) closes the
+	 * dialog by itself.
+	 */
 	public void finished(ProjectExporter.Result result) {
 		onEdt(() -> {
 			running = false;
+			elapsedTimer.stop();
 			resultDir = result.rootDir();
 			bar.setIndeterminate(false);
 			if (!result.cancelled()) {
@@ -409,16 +555,24 @@ public class ExportDialog extends JDialog {
 			}
 			progressLabel.setText("<html>" + escapeHtml(result.summary()) + "</html>");
 			cancelExportButton.setEnabled(false);
+			exportButton.setEnabled(true);
 			boolean hasFolder = Files.isDirectory(result.rootDir());
 			openFolderButton.setVisible(hasFolder);
 			closeButton.setText("Close");
-			// A clean run closes itself right away -- the same summary is flashed in the Native
-			// View's status bar and written to the manifest -- honouring "open the export folder"
-			// on the way out. A cancelled or partly failed run stays open, so what did and didn't
-			// make it out can actually be read here.
-			boolean clean = !result.cancelled()
-					&& result.libraryResults().stream().noneMatch(r -> r.failed());
-			if (clean) {
+			markUnreachedRows(result.cancelled());
+			if (result.cancelled()) {
+				// An interruption, not an answer: the options come back -- same choices, ready
+				// to retry -- with the previous run's outcome on top so nothing is lost track of.
+				lastRunLabel.setText("<html>" + escapeHtml(result.summary()) + "</html>");
+				showCard("options");
+				return;
+			}
+			// Only a completely clean run closes itself right away -- the same summary is flashed
+			// in the Native View's status bar and written to the manifest -- honouring "open the
+			// export folder" on the way out. A partly failed run (a failed library, a failed
+			// function, an unwritable root -- even with an empty library list) stays open, so what
+			// did and didn't make it out can actually be read here.
+			if (result.isClean()) {
 				if (openWhenDoneCheck.isSelected() && hasFolder && !openFolder()) {
 					return; // could not open it -- stay open, with the reason on screen
 				}
@@ -430,12 +584,27 @@ public class ExportDialog extends JDialog {
 	private static String describe(ProjectExporter.Progress p) {
 		String lib = "Library " + (p.libIndex() + 1) + "/" + p.libCount() + ": " + p.libraryName();
 		if (!"exporting".equals(p.phase())) {
-			return lib + " — analyzing (Ghidra is running; large libraries can take a while)";
+			// the bridge knows how many functions it has analyzed so far: show that, so even the
+			// analysis phase moves instead of looking frozen (0/0 means counts unknown, e.g. queued)
+			return p.totalFunctions() > 0
+					? lib + " — analyzing (Ghidra): " + p.doneFunctions() + " / " + p.totalFunctions()
+							+ " functions" + detailSuffix(p)
+					: lib + " — analyzing (Ghidra is running; large libraries can take a while)"
+							+ detailSuffix(p);
 		}
 		if (p.totalFunctions() <= 0) {
 			return lib + " — listing functions…";
 		}
 		return lib + " — exporting function " + Math.max(1, p.doneFunctions()) + " / " + p.totalFunctions();
+	}
+
+	/** The bridge's current task text, shortened so it can never stretch the window. */
+	private static String detailSuffix(ProjectExporter.Progress p) {
+		String d = p.detail();
+		if (d == null || d.isEmpty()) {
+			return "";
+		}
+		return " · " + (d.length() > 70 ? d.substring(0, 67) + "…" : d);
 	}
 
 	// ------------------------------------------------------------------ chrome
@@ -451,7 +620,9 @@ public class ExportDialog extends JDialog {
 		}
 		cancelled.set(true);
 		cancelExportButton.setEnabled(false);
-		progressLabel.setText("Cancelling — finishing the current function…");
+		// the analysis poll and the function loop both observe the flag, so this lands within
+		// one bridge round-trip -- never "after Ghidra finishes"
+		progressLabel.setText("Cancelling…");
 	}
 
 	/** Close the dialog, or -- while an export is running -- ask that export to cancel instead. */
